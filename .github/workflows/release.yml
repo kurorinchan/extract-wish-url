@@ -47,3 +47,5 @@ jobs:
         with:
           executable-name: extract-with-url
           target: ${{ matrix.job.target }}
+          # Setting this to empty should avoid looking for change log file.
+          changes-file: ""
