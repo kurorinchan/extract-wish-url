@@ -1,0 +1,19 @@
+name: Regression tests
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macOS-latest, windows-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - name: Setup Rust
+      uses: hecrj/setup-rust-action@v2
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Run tests
+      run: cargo test
