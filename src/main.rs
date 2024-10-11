@@ -92,10 +92,6 @@ fn get_to_data2_file(genshin_install_path: &Path) -> Option<PathBuf> {
 
     let mut versioned_dirs = collect_versioned_directories(&web_caches);
 
-    println!("Found {} versioned directories", versioned_dirs.len());
-    for f in versioned_dirs.iter() {
-        println!("  {:?}", f);
-    }
     if versioned_dirs.is_empty() {
         println!("Failed to find any versioned directories");
         return None;
@@ -120,11 +116,7 @@ fn find_gacha_url_in_slice(content: &[u8]) -> Result<String> {
         .build(patterns)
         .unwrap();
 
-    println!("searching for pattern {:?}", patterns);
-    let mat = ac.find(&content).context("failed to find pattern")?;
-    println!("found pattern {:?}", mat);
-
-    let gacha_marker_end = mat.end();
+    let gacha_marker_end = ac.find(&content).context("failed to find pattern")?.end();
 
     // Keep reading until "game_biz=hk4e_global" is encountered, thats where the URL ends.
     let rest_of_content = &content[gacha_marker_end..];
@@ -134,17 +126,25 @@ fn find_gacha_url_in_slice(content: &[u8]) -> Result<String> {
         .build(patterns)
         .unwrap();
 
-    println!("searching for pattern {:?}", patterns);
     let mat = ac
         .find(rest_of_content)
         .context(format!("Failed to find {} in file", patterns[0]))?;
-    println!("found pattern {:?}", mat);
 
+    // Note that this variable contains the index from the beginning of |content|.
+    // Since URLs can only be a certain length, the value in this variable is used to slice
+    // |content| to find the beginning of the URL.
     let url_end_pos = mat.end() + gacha_marker_end;
+    const MAX_URL_LENGTH: usize = 2048;
+    let url_search_start_pos = if url_end_pos < MAX_URL_LENGTH {
+        0
+    } else {
+        url_end_pos - MAX_URL_LENGTH
+    };
 
-    let content = &content[..url_end_pos];
-    let mut reversed_content: Vec<u8> = content.to_vec();
-    reversed_content.reverse();
+    let potential_url_slice = &content[url_search_start_pos..url_end_pos];
+
+    let mut reversed_slice: Vec<u8> = potential_url_slice.to_vec();
+    reversed_slice.reverse();
 
     // reverse of "https://gs.hoyoverse.com/"
     let reversed_patterns = &["/moc.esrevoyoh.sg//:sptth"];
@@ -152,13 +152,9 @@ fn find_gacha_url_in_slice(content: &[u8]) -> Result<String> {
         .ascii_case_insensitive(false)
         .build(reversed_patterns)?;
 
-    println!("searching for pattern {:?}", reversed_patterns);
-    let mat = ac
-        .find(&reversed_content)
-        .context("Failed to find pattern")?;
-    println!("found pattern {:?}", mat);
+    let mat = ac.find(&reversed_slice).context("Failed to find pattern")?;
 
-    let target_url = &reversed_content[..mat.end()];
+    let target_url = &reversed_slice[..mat.end()];
     let mut target_url: Vec<u8> = target_url.to_vec();
     target_url.reverse();
     let target_url = String::from_utf8(target_url.to_vec())?;
@@ -191,13 +187,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn find_gacha_url_only_url() {
+        let test_url = "https://gs.hoyoverse.com/genshin/event/e20190909gacha-v3/index.html?anythinghere&game_biz=hk4e_global";
+
+        // any data.
+        let mut test_data: Vec<u8> = vec![2, 8, 11, 22, 93];
+        test_data.extend_from_slice(test_url.as_bytes());
+        // More irrelevant data at end.
+        test_data.extend_from_slice(&[43, 100, 65, 2, 1, 4, 73]);
+
+        let result = find_gacha_url_in_slice(&test_data);
+        assert!(result.is_ok());
+        assert_eq!(test_url, result.unwrap());
+    }
+
+    // Verify it can find the URL in binary data.
+    #[test]
     fn find_gacha_url() {
         let test_url = "https://gs.hoyoverse.com/genshin/event/e20190909gacha-v3/index.html?anythinghere&game_biz=hk4e_global";
         let test_url_vec = test_url.as_bytes().to_vec();
+
         let result = find_gacha_url_in_slice(&test_url_vec);
         assert!(result.is_ok());
-
         assert_eq!(test_url, result.unwrap());
+    }
+
+    // gacha-v3 marker is in the url but cannot find the end.
+    #[test]
+    fn no_gacha_url_has_marker_no_end_marker() {
+        let test_url =
+            "https://gs.hoyoverse.com/genshin/event/e20190909gacha-v3/index.html?anythinghere";
+        let test_url_vec = test_url.as_bytes().to_vec();
+        let result = find_gacha_url_in_slice(&test_url_vec);
+        assert!(result.is_err());
+    }
+
+    // gacha-v3 marker and game_biz=hk4e_global are present but cannot find https:// start.
+    #[test]
+    fn no_gacha_url_has_marker_has_end_marker_no_start_marker() {
+        let test_url = "verse.com/genshin/event/e20190909gacha-v3/index.html?anythinghere";
+        let test_url_vec = test_url.as_bytes().to_vec();
+        let result = find_gacha_url_in_slice(&test_url_vec);
+        assert!(result.is_err());
     }
 
     #[test]
