@@ -1,0 +1,8 @@
+[package]
+name = "extract-wish"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aho-corasick = "1.1.3"
+anyhow = "1.0.89"
