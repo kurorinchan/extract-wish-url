@@ -45,7 +45,7 @@ jobs:
       - name: Publish artifacts and release
         uses: houseabsolute/actions-rust-release@v0
         with:
-          executable-name: extract-with-url
+          executable-name: extract-wish-url
           target: ${{ matrix.job.target }}
           # Setting this to empty should avoid looking for change log file.
           changes-file: ""
