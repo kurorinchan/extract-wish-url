@@ -83,11 +83,13 @@ fn collect_versioned_directories(path: &Path) -> Vec<VersionedDirectory> {
         .collect()
 }
 
+const RELATIVE_PATH_TO_WEBCACHES: &[&str] = &["GenshinImpact_Data", "webCaches"];
+const RELATIVE_PATH_TO_DATA2: &[&str] = &["Cache", "Cache_Data", "data_2"];
+
 fn get_to_data2_file(genshin_install_path: &Path) -> Option<PathBuf> {
-    let web_caches = genshin_install_path
-        .join("GenshinImpact_Data")
-        .join("webCaches")
-        .to_path_buf();
+    let web_caches =
+        genshin_install_path.join(RELATIVE_PATH_TO_WEBCACHES.iter().collect::<PathBuf>());
+
     let mut versioned_dirs = collect_versioned_directories(&web_caches);
 
     println!("Found {} versioned directories", versioned_dirs.len());
@@ -100,15 +102,11 @@ fn get_to_data2_file(genshin_install_path: &Path) -> Option<PathBuf> {
     }
 
     // Note that this is descending order, i.e. the biggest version is at the front.
+    // The latest gacha info is in the latest webcache dir.
     versioned_dirs.sort_by(|a, b| b.version.cmp(&a.version));
-
     let latest_version_dir = &versioned_dirs[0].path;
 
-    let data2_path = latest_version_dir
-        .join("Cache")
-        .join("Cache_Data")
-        .join("data_2");
-
+    let data2_path = latest_version_dir.join(RELATIVE_PATH_TO_DATA2.iter().collect::<PathBuf>());
     if !data2_path.is_file() {
         return None;
     }
@@ -188,6 +186,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
 
     #[test]
@@ -198,5 +198,22 @@ mod tests {
         assert!(result.is_ok());
 
         assert_eq!(test_url, result.unwrap());
+    }
+
+    #[test]
+    fn get_data2_path() -> Result<()> {
+        let dir = tempdir()?;
+        let cache_data_dir = dir
+            .path()
+            .join("GenshinImpact_Data")
+            .join("webCaches")
+            .join("4.5.6.7")
+            .join("Cache")
+            .join("Cache_Data");
+        std::fs::create_dir_all(cache_data_dir.clone())?;
+        std::fs::File::create(cache_data_dir.join("data_2"))?;
+
+        assert!(get_to_data2_file(dir.path()).is_some());
+        Ok(())
     }
 }
