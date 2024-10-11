@@ -40,7 +40,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "extract-wish"
+name = "extract-wish-url"
 version = "0.1.0"
 dependencies = [
  "aho-corasick",
