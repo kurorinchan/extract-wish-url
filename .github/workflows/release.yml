@@ -38,7 +38,7 @@ jobs:
         uses: houseabsolute/actions-rust-cross@v0
         with:
           command: build
-          target: ${{ matrix.platform.target }}
+          target: ${{ matrix.job.target }}
           args: "--locked --release"
           strip: true
 
@@ -46,4 +46,4 @@ jobs:
         uses: houseabsolute/actions-rust-release@v0
         with:
           executable-name: extract-with-url
-          target: ${{ matrix.platform.target }}
+          target: ${{ matrix.job.target }}
