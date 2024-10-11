@@ -44,7 +44,6 @@ struct VersionedDirectory {
 fn filename_to_version(filename: &str) -> Option<Version> {
     let parts = filename.split('.').collect::<Vec<&str>>();
     if parts.len() != 4 {
-        println!("Invalid filename: {}", filename);
         return None;
     }
     let major = parts[0].parse::<u32>().ok()?;
@@ -109,22 +108,25 @@ fn get_to_data2_file(genshin_install_path: &Path) -> Option<PathBuf> {
     Some(data2_path)
 }
 
-fn find_gacha_url_in_slice(content: &[u8]) -> Result<String> {
-    let patterns = &["e20190909gacha-v3"];
-    let ac = AhoCorasick::builder()
-        .ascii_case_insensitive(false)
-        .build(patterns)
-        .unwrap();
+const GACHA_URL_MARKER: &str = "e20190909gacha-v3";
+const URL_END_MARKER: &str = "game_biz=hk4e_global";
 
-    let gacha_marker_end = ac.find(&content).context("failed to find pattern")?.end();
+// reverse of "https://gs.hoyoverse.com/"
+const URL_START_REVERSED: &str = "/moc.esrevoyoh.sg//:sptth";
+
+fn find_gacha_url_in_slice(content: &[u8]) -> Result<String> {
+    let patterns = &[GACHA_URL_MARKER];
+    let ac = AhoCorasick::builder().build(patterns)?;
+
+    let gacha_marker_end = ac
+        .find(&content)
+        .context(format!("Failed to find pattern {}", patterns[0]))?
+        .end();
 
     // Keep reading until "game_biz=hk4e_global" is encountered, thats where the URL ends.
     let rest_of_content = &content[gacha_marker_end..];
-    let patterns = &["game_biz=hk4e_global"];
-    let ac = AhoCorasick::builder()
-        .ascii_case_insensitive(false)
-        .build(patterns)
-        .unwrap();
+    let patterns = &[URL_END_MARKER];
+    let ac = AhoCorasick::builder().build(patterns)?;
 
     let mat = ac
         .find(rest_of_content)
@@ -143,16 +145,18 @@ fn find_gacha_url_in_slice(content: &[u8]) -> Result<String> {
 
     let potential_url_slice = &content[url_search_start_pos..url_end_pos];
 
+    // There could be multiple URL start markers in the slice.
+    // So reverse the potential slice and find the reversed pattern, to find the first occurrence.
     let mut reversed_slice: Vec<u8> = potential_url_slice.to_vec();
     reversed_slice.reverse();
 
-    // reverse of "https://gs.hoyoverse.com/"
-    let reversed_patterns = &["/moc.esrevoyoh.sg//:sptth"];
-    let ac = AhoCorasick::builder()
-        .ascii_case_insensitive(false)
-        .build(reversed_patterns)?;
+    let reversed_patterns = &[URL_START_REVERSED];
+    let ac = AhoCorasick::builder().build(reversed_patterns)?;
 
-    let mat = ac.find(&reversed_slice).context("Failed to find pattern")?;
+    let mat = ac.find(&reversed_slice).context(format!(
+        "Failed to find reversed pattern: {}",
+        reversed_patterns[0]
+    ))?;
 
     let target_url = &reversed_slice[..mat.end()];
     let mut target_url: Vec<u8> = target_url.to_vec();
@@ -168,7 +172,10 @@ fn find_gacha_url_in_data2(data2_path: &Path) -> Result<String> {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    println!("Hello, {}!", args[1]);
+    if args.len() != 2 {
+        println!("Usage: {} <path to genshin install directory>", args[0]);
+        std::process::exit(1);
+    }
     let path = Path::new(args[1].as_str());
     if !path.exists() {
         println!("{} does not exist", path.display());
@@ -177,7 +184,11 @@ fn main() {
 
     let data_path = get_to_data2_file(path);
     let result = find_gacha_url_in_data2(&data_path.unwrap());
-    println!("{:?}", result);
+    if let Ok(url) = result {
+        println!("{}", url);
+    } else {
+        println!("Failed to find gacha URL");
+    }
 }
 
 #[cfg(test)]
