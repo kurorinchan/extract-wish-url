@@ -1,13 +1,32 @@
+use aho_corasick::AhoCorasick;
+use anyhow::{Context, Result};
+use enum_assoc::Assoc;
 use std::cmp::Ordering;
 use std::env;
-
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use strum::IntoEnumIterator;
+use strum_macros::EnumIter;
 
-use aho_corasick::AhoCorasick;
-
-use anyhow::{Context, Result};
+// If there are more games, add them here.
+#[derive(Debug, Assoc, EnumIter)]
+#[func(fn data_dir(&self) -> &'static str)]
+#[func(fn marker(&self) -> &'static str)]
+#[func(fn url_start(&self) -> &'static str)]
+#[func(fn url_end(&self) -> &'static str)]
+enum GameType {
+    #[assoc(data_dir = "GenshinImpact_Data")]
+    #[assoc(marker = "e20190909gacha-v3")]
+    #[assoc(url_start = "https://gs.hoyoverse.com/")]
+    #[assoc(url_end = "game_biz=hk4e_global")]
+    GenshinGlobal,
+    #[assoc(data_dir = "ZenlessZoneZero_Data")]
+    #[assoc(marker = "e20230424gacha")]
+    #[assoc(url_start = "https://gs.hoyoverse.com/")]
+    #[assoc(url_end = "game_biz=nap_global")]
+    ZenlessZoneZeroGlobal,
+}
 
 // Genshin's version folders have 4 numbers.
 // The field names are arbitrary names that I gave, not from any source.
@@ -35,10 +54,61 @@ impl PartialOrd for Version {
     }
 }
 
-#[derive(Debug)]
 struct VersionedDirectory {
     path: PathBuf,
     version: Version,
+}
+
+struct PullExtractor {
+    data_dir: PathBuf,
+    url_start: String,
+    marker: String,
+    end_marker: String,
+}
+
+impl PullExtractor {
+    fn new(install_path: &Path) -> Result<Self> {
+        let game_type = GameType::iter()
+            .find_map(|game_type| {
+                let data_dir = install_path.join(game_type.data_dir());
+                if !data_dir.is_dir() {
+                    return None;
+                }
+                Some(game_type)
+            })
+            .with_context(|| {
+                let prefix = "Failed to find one of the following directories:\n";
+                let dirs = GameType::iter()
+                    .map(|game_type| game_type.data_dir().to_string())
+                    .collect::<Vec<String>>()
+                    .join(" ");
+                format!("{}{}", prefix, dirs)
+            })?;
+
+        let data_dir = install_path.join(game_type.data_dir());
+        Ok(Self {
+            data_dir,
+            marker: game_type.marker().to_string(),
+            url_start: game_type.url_start().to_string(),
+            end_marker: game_type.url_end().to_string(),
+        })
+    }
+
+    fn extract_url(&self) -> Result<String> {
+        const WEB_CACHE_DIR_NAME: &str = "webCaches";
+        let web_cache_dir = self.data_dir.join(WEB_CACHE_DIR_NAME);
+        if !web_cache_dir.is_dir() {
+            return Err(anyhow::anyhow!(
+                "{} is not a directory",
+                web_cache_dir.display()
+            ));
+        }
+
+        let data2_path = get_to_data2_file(&web_cache_dir).context("Failed to find data_2 file")?;
+
+        let content = fs::read(data2_path).context("Failed to read data_2 file")?;
+        find_gacha_url_in_slice(&content, &self.marker, &self.url_start, &self.end_marker)
+    }
 }
 
 fn filename_to_version(filename: &str) -> Option<Version> {
@@ -82,14 +152,10 @@ fn collect_versioned_directories(path: &Path) -> Vec<VersionedDirectory> {
         .collect()
 }
 
-const RELATIVE_PATH_TO_WEBCACHES: &[&str] = &["GenshinImpact_Data", "webCaches"];
 const RELATIVE_PATH_TO_DATA2: &[&str] = &["Cache", "Cache_Data", "data_2"];
 
-fn get_to_data2_file(genshin_install_path: &Path) -> Option<PathBuf> {
-    let web_caches =
-        genshin_install_path.join(RELATIVE_PATH_TO_WEBCACHES.iter().collect::<PathBuf>());
-
-    let mut versioned_dirs = collect_versioned_directories(&web_caches);
+fn get_to_data2_file(web_cache_dir: &Path) -> Option<PathBuf> {
+    let mut versioned_dirs = collect_versioned_directories(web_cache_dir);
 
     if versioned_dirs.is_empty() {
         println!("Failed to find any versioned directories");
@@ -108,24 +174,23 @@ fn get_to_data2_file(genshin_install_path: &Path) -> Option<PathBuf> {
     Some(data2_path)
 }
 
-const GACHA_URL_MARKER: &str = "e20190909gacha-v3";
-const URL_END_MARKER: &str = "game_biz=hk4e_global";
-
-// reverse of "https://gs.hoyoverse.com/"
-const URL_START_REVERSED: &str = "/moc.esrevoyoh.sg//:sptth";
-
-fn find_gacha_url_in_slice(content: &[u8]) -> Result<String> {
-    let patterns = &[GACHA_URL_MARKER];
+fn find_gacha_url_in_slice(
+    content: &[u8],
+    marker: &str,
+    url_start: &str,
+    end_marker: &str,
+) -> Result<String> {
+    let patterns = &[marker];
     let ac = AhoCorasick::builder().build(patterns)?;
 
     let gacha_marker_end = ac
-        .find(&content)
+        .find(content)
         .context(format!("Failed to find pattern {}", patterns[0]))?
         .end();
 
     // Keep reading until "game_biz=hk4e_global" is encountered, thats where the URL ends.
     let rest_of_content = &content[gacha_marker_end..];
-    let patterns = &[URL_END_MARKER];
+    let patterns = &[end_marker];
     let ac = AhoCorasick::builder().build(patterns)?;
 
     let mat = ac
@@ -150,7 +215,9 @@ fn find_gacha_url_in_slice(content: &[u8]) -> Result<String> {
     let mut reversed_slice: Vec<u8> = potential_url_slice.to_vec();
     reversed_slice.reverse();
 
-    let reversed_patterns = &[URL_START_REVERSED];
+    // Note that the URL start marker is also reversed here to match the reversed data above.
+    let reversed_start_url = url_start.chars().rev().collect::<String>();
+    let reversed_patterns = &[&reversed_start_url];
     let ac = AhoCorasick::builder().build(reversed_patterns)?;
 
     let mat = ac.find(&reversed_slice).context(format!(
@@ -165,12 +232,7 @@ fn find_gacha_url_in_slice(content: &[u8]) -> Result<String> {
     Ok(target_url)
 }
 
-fn find_gacha_url_in_data2(data2_path: &Path) -> Result<String> {
-    let content = fs::read(data2_path)?;
-    find_gacha_url_in_slice(&content)
-}
-
-fn main() {
+fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
         println!("Usage: {} <path to genshin install directory>", args[0]);
@@ -182,13 +244,15 @@ fn main() {
         std::process::exit(1);
     }
 
-    let data_path = get_to_data2_file(path);
-    let result = find_gacha_url_in_data2(&data_path.unwrap());
-    if let Ok(url) = result {
+    let extractor = PullExtractor::new(path)?;
+    let url = extractor.extract_url();
+    if let Ok(url) = url {
         println!("{}", url);
     } else {
         println!("Failed to find gacha URL");
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -207,7 +271,12 @@ mod tests {
         // More irrelevant data at end.
         test_data.extend_from_slice(&[43, 100, 65, 2, 1, 4, 73]);
 
-        let result = find_gacha_url_in_slice(&test_data);
+        let result = find_gacha_url_in_slice(
+            &test_data,
+            "gacha-v3",
+            "https://gs.hoyoverse.com/",
+            "game_biz=hk4e_global",
+        );
         assert!(result.is_ok());
         assert_eq!(test_url, result.unwrap());
     }
@@ -218,7 +287,12 @@ mod tests {
         let test_url = "https://gs.hoyoverse.com/genshin/event/e20190909gacha-v3/index.html?anythinghere&game_biz=hk4e_global";
         let test_url_vec = test_url.as_bytes().to_vec();
 
-        let result = find_gacha_url_in_slice(&test_url_vec);
+        let result = find_gacha_url_in_slice(
+            &test_url_vec,
+            "gacha-v3",
+            "https://gs.hoyoverse.com/",
+            "game_biz=hk4e_global",
+        );
         assert!(result.is_ok());
         assert_eq!(test_url, result.unwrap());
     }
@@ -229,7 +303,12 @@ mod tests {
         let test_url =
             "https://gs.hoyoverse.com/genshin/event/e20190909gacha-v3/index.html?anythinghere";
         let test_url_vec = test_url.as_bytes().to_vec();
-        let result = find_gacha_url_in_slice(&test_url_vec);
+        let result = find_gacha_url_in_slice(
+            &test_url_vec,
+            "gacha-v3",
+            "https://gs.hoyoverse.com/",
+            "game_biz=hk4e_global",
+        );
         assert!(result.is_err());
     }
 
@@ -238,7 +317,12 @@ mod tests {
     fn no_gacha_url_has_marker_has_end_marker_no_start_marker() {
         let test_url = "verse.com/genshin/event/e20190909gacha-v3/index.html?anythinghere";
         let test_url_vec = test_url.as_bytes().to_vec();
-        let result = find_gacha_url_in_slice(&test_url_vec);
+        let result = find_gacha_url_in_slice(
+            &test_url_vec,
+            "gacha-v3",
+            "https://gs.hoyoverse.com/",
+            "game_biz=hk4e_global",
+        );
         assert!(result.is_err());
     }
 
@@ -255,7 +339,9 @@ mod tests {
         std::fs::create_dir_all(cache_data_dir.clone())?;
         std::fs::File::create(cache_data_dir.join("data_2"))?;
 
-        assert!(get_to_data2_file(dir.path()).is_some());
+        assert!(
+            get_to_data2_file(&dir.path().join("GenshinImpact_Data").join("webCaches")).is_some()
+        );
         Ok(())
     }
 }
