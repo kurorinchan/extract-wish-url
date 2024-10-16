@@ -1,6 +1,9 @@
 # What
 
-Finds the URL for uploading wish history to [paimon.moe](https://paimon.moe/). Specifically, the import page https://paimon.moe/wish/import
+Finds the URL for uploading pull history for Hoyoverse games.
+Examples of sites that use the extracted URL are:
+- [paimon.moe](https://paimon.moe/) (Genshin)
+- [stardb.gg](https://stardb.gg/) (Zenless Zone Zero)
 
 # Usage
 
@@ -11,6 +14,7 @@ Download the tool for your platform from [releases](https://github.com/kurorinch
 ```
 
 The install directory is the directory that contains `GenshinImpact_Data/` directory.
+Or `ZenlessZoneZero_Data` for Zenless Zone Zero.
 
 # Why use this tool
 
