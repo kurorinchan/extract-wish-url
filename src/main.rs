@@ -1,15 +1,26 @@
-use anyhow::{Context, Result};
+use anyhow::bail;
+use anyhow::{anyhow, Context, Result};
 use bstr::ByteSlice;
 use enum_assoc::Assoc;
+use reqwest::blocking::Client;
+use reqwest::Url;
+use serde_json::Value;
+use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::env;
+use std::f32::consts::E;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
 
+const MAX_URL_LENGTH: usize = 2048;
+
 // If there are more games, add them here.
+// TODO: This might not be necessary since there is a struct that contains this anyways. Move it
+// in its contructor.
 #[derive(Debug, Assoc, EnumIter)]
 #[func(fn data_dir(&self) -> &'static str)]
 #[func(fn marker(&self) -> &'static str)]
@@ -22,8 +33,8 @@ enum GameType {
     #[assoc(url_end = "game_biz=hk4e_global")]
     GenshinGlobal,
     #[assoc(data_dir = "ZenlessZoneZero_Data")]
-    #[assoc(marker = "e20230424gacha")]
-    #[assoc(url_start = "https://gs.hoyoverse.com/")]
+    #[assoc(marker = "getGachaLog")]
+    #[assoc(url_start = "https://")]
     #[assoc(url_end = "game_biz=nap_global")]
     ZenlessZoneZeroGlobal,
 }
@@ -59,11 +70,16 @@ struct VersionedDirectory {
     version: Version,
 }
 
+// Function type for checking the gacha URL (&str) passed in. Since the testing could transform
+// the URL, it returns a String on success.
+type TestGachaUrlFn = Box<dyn Fn(&str) -> Result<String>>;
+
 struct PullExtractor {
     data_dir: PathBuf,
     url_start: String,
     marker: String,
     end_marker: String,
+    valid_url_check_fn: TestGachaUrlFn,
 }
 
 impl PullExtractor {
@@ -85,12 +101,20 @@ impl PullExtractor {
                 format!("{}{}", prefix, dirs)
             })?;
 
+        let valid_url_check_fn: TestGachaUrlFn = match game_type {
+            GameType::GenshinGlobal => {
+                Box::new(|url| test_genshin_wish_url(url, "public-operation-hk4e-sg.hoyoverse.com"))
+            }
+            GameType::ZenlessZoneZeroGlobal => Box::new(|url: &str| test_zzz_signal_url(url)),
+        };
+
         let data_dir = install_path.join(game_type.data_dir());
         Ok(Self {
             data_dir,
             marker: game_type.marker().to_string(),
             url_start: game_type.url_start().to_string(),
             end_marker: game_type.url_end().to_string(),
+            valid_url_check_fn,
         })
     }
 
@@ -113,7 +137,20 @@ impl PullExtractor {
             return Err(anyhow::anyhow!("Found no gacha URLs"));
         }
 
-        Ok(urls[0].to_string())
+        for url in urls {
+            let result = (self.valid_url_check_fn)(&url);
+            match result {
+                Ok(url) => return Ok(url),
+                Err(e) => {
+                    log::debug!("Testing {} returned an error: {}", url, e);
+                    continue;
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "Failed to find a working gacha URL. Check the gacha logs in game first."
+        ))
     }
 }
 
@@ -200,7 +237,6 @@ fn find_gacha_urls_in_slice(
 
         // Since URLs can only be a certain length, the value in this variable is used to slice
         // |content| to find the beginning of the URL.
-        const MAX_URL_LENGTH: usize = 2048;
         let url_search_start_pos = url_end_pos.saturating_sub(MAX_URL_LENGTH);
 
         let potential_url_slice = &content[url_search_start_pos..url_end_pos];
@@ -220,7 +256,95 @@ fn find_gacha_urls_in_slice(
     Ok(urls)
 }
 
+fn test_genshin_wish_url(url: &str, api_host: &str) -> Result<String> {
+    log::debug!("Checking genshin wish url: {}", url);
+    let client = Client::new();
+    let mut uri =
+        reqwest::Url::parse(url).with_context(|| format!("{} is not a valid URL", url))?;
+
+    uri.set_path("gacha_info/api/getGachaLog");
+    uri.set_host(Some(api_host))
+        .with_context(|| format!("Failed to set host to {}", api_host))?;
+    uri.set_fragment(None);
+
+    let mut query_params: HashMap<Cow<str>, Cow<str>> = uri.query_pairs().collect();
+    query_params.insert("lang".into(), "en".into());
+    query_params.insert("gacha_type".into(), "301".into());
+    query_params.insert("size".into(), "5".into());
+    query_params.insert("lang".into(), "en-us".into());
+
+    uri.set_query(Some(
+        &serde_urlencoded::to_string(&query_params).context("Failed to set query params")?,
+    ));
+
+    let response = client
+        .get(uri.as_str())
+        .header("Content-Type", "application/json")
+        .send()?
+        .json::<Value>()?;
+
+    let retcode = response
+        .get("retcode")
+        .context("Failed to find retcode in response JSON")?;
+
+    log::debug!("Got retcode: {}", retcode);
+
+    let retcode = retcode
+        .as_i64()
+        .context("Failed to convert retcode to i64")?;
+    if retcode != 0 {
+        Ok(url.to_string())
+    } else {
+        anyhow::bail!("JSON retcode did not contain 0, it was {}", retcode)
+    }
+}
+
+// TODO: A test with dependency injection would be good.
+fn test_zzz_signal_url(url: &str) -> Result<String> {
+    log::debug!("Checking zzz signal url: {}", url);
+    let client = Client::new();
+    let response = client
+        .get(url)
+        .header("Content-Type", "application/json")
+        .send()
+        .and_then(|resp| resp.json::<Value>())
+        .context("Failed to get json response")?;
+
+    log::debug!("Response JSON: {:?}", response);
+
+    const RETURN_CODE_FIELD_NAME: &str = "retcode";
+    let retcode = response.get(RETURN_CODE_FIELD_NAME).context(format!(
+        "Response JSON from {} did not contain a {} field",
+        url, RETURN_CODE_FIELD_NAME
+    ))?;
+
+    log::debug!("{} contained: {}", RETURN_CODE_FIELD_NAME, retcode);
+
+    let retcode = retcode.as_i64().context("Not a number.")?;
+    if retcode != 0 {
+        bail!("Got non-zero return code: {}", retcode);
+    }
+
+    let parsed_url = Url::parse(url).context("Failed to parse URL")?;
+    let mut query_params: Vec<(String, String)> = parsed_url.query_pairs().into_owned().collect();
+    const KEYS_TO_KEEP: [&str; 5] = ["authkey", "authkey_ver", "sign_type", "game_biz", "lang"];
+    query_params.retain(|(key, _)| KEYS_TO_KEEP.contains(&key.as_str()));
+
+    Ok(format!(
+        "{}://{}{}?{}",
+        parsed_url.scheme(),
+        parsed_url
+            .host()
+            .context(format!("Cannot find host in URL: {}", url))?,
+        parsed_url.path(),
+        serde_urlencoded::to_string(&query_params)
+            .with_context(|| format!("Failed to serialize query params {:?}", &query_params))?
+    ))
+}
+
 fn main() -> Result<()> {
+    env_logger::init();
+
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
         println!("Usage: {} <path to genshin install directory>", args[0]);
@@ -233,11 +357,15 @@ fn main() -> Result<()> {
     }
 
     let extractor = PullExtractor::new(path)?;
-    let url = extractor.extract_url();
-    if let Ok(url) = url {
+    let result = extractor.extract_url();
+    if let Ok(url) = result {
+        println!("Found gacha URL! Copy the URL below:");
         println!("{}", url);
     } else {
-        println!("Failed to find gacha URL");
+        println!(
+            "Failed to find gacha URL with error: {}",
+            result.unwrap_err()
+        );
     }
 
     Ok(())
@@ -362,5 +490,58 @@ mod tests {
             get_to_data2_file(&dir.path().join("GenshinImpact_Data").join("webCaches")).is_some()
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_zzz_url() -> Result<()> {
+        let mut server = mockito::Server::new();
+        let url= format!("{}{}{}",
+            "http://", 
+            &server.host_with_port(),
+            // Note that these include the required params.
+            "/index.html?extraparam=1234&authkey=key&authkey_ver=2&sign_type=sometype&game_biz=nap_global&lang=en&more=stuff&andsomemore=fluffs");
+
+        // Create a mock
+        let mock = server
+            // This path matches the above.
+            .mock("GET", "/index.html?extraparam=1234&authkey=key&authkey_ver=2&sign_type=sometype&game_biz=nap_global&lang=en&more=stuff&andsomemore=fluffs")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            // A minimal JSON to return retcode=0.
+            .with_body(r#"{"retcode": 0}"#)
+            .create();
+
+        let result = test_zzz_signal_url(&url)?;
+        // Verify that extraneous params are removed.
+        // Hardcoded 127.0.0.1 without a port number. Note that
+        // server.host_with_port() includes a port number.
+        // Its ok to change the host here if the framework changes.
+        assert_eq!("http://127.0.0.1/index.html?authkey=key&authkey_ver=2&sign_type=sometype&game_biz=nap_global&lang=en", result);
+        mock.assert();
+        Ok(())
+    }
+
+    #[test]
+    fn test_zzz_url_retcode_not_0() {
+        let mut server = mockito::Server::new();
+        let url= format!("{}{}{}",
+            "http://", 
+            &server.host_with_port(),
+            // Note that these include the required params.
+            "/index.html?extraparam=1234&authkey=key&authkey_ver=2&sign_type=sometype&game_biz=nap_global&lang=en&more=stuff&andsomemore=fluffs");
+
+        // Create a mock
+        let mock = server
+            // This path matches the above.
+            .mock("GET", "/index.html?extraparam=1234&authkey=key&authkey_ver=2&sign_type=sometype&game_biz=nap_global&lang=en&more=stuff&andsomemore=fluffs")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            // Retcode is -1! The function should return an error.
+            .with_body(r#"{"retcode": -1}"#)
+            .create();
+
+        let result = test_zzz_signal_url(&url);
+        assert!(result.is_err());
+        mock.assert();
     }
 }
