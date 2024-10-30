@@ -1,0 +1,44 @@
+name: Builds
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { os: ubuntu-latest  , target: x86_64-unknown-linux-gnu       , use-cross: false , extension: ""   }
+          - { os: ubuntu-latest  , target: x86_64-unknown-linux-musl      , use-cross: true  , extension: ""   }
+          - { os: ubuntu-latest  , target: armv7-unknown-linux-gnueabihf  , use-cross: true  , extension: ""   }
+          - { os: ubuntu-latest  , target: armv7-unknown-linux-musleabihf , use-cross: true  , extension: ""   }
+          - { os: ubuntu-latest  , target: aarch64-unknown-linux-gnu      , use-cross: true  , extension: ""   }
+          - { os: ubuntu-latest  , target: aarch64-unknown-linux-musl     , use-cross: true  , extension: ""   }
+          - { os: macos-latest   , target: x86_64-apple-darwin            , use-cross: false , extension: ""   }
+          - { os: macos-latest   , target: aarch64-apple-darwin           , use-cross: false , extension: ""   }
+          - { os: windows-latest , target: x86_64-pc-windows-msvc         , use-cross: false , extension: .exe }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: hecrj/setup-rust-action@v2
+        with:
+          targets: ${{ matrix.job.target }}
+
+      - name: Build release binary
+        uses: houseabsolute/actions-rust-cross@v0
+        with:
+          command: build
+          target: ${{ matrix.job.target }}
+          args: "--locked --release"
+          strip: true
+      
+      - name: Build debug binary
+        uses: houseabsolute/actions-rust-cross@v0
+        with:
+          command: build
+          target: ${{ matrix.job.target }}
+          args: "--locked"
+          strip: true
