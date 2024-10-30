@@ -1,7 +1,7 @@
+use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::{Context, Result};
 use bstr::ByteSlice;
-use enum_assoc::Assoc;
 use reqwest::blocking::Client;
 use reqwest::Url;
 use serde_json::Value;
@@ -12,30 +12,19 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
-use strum::IntoEnumIterator;
-use strum_macros::EnumIter;
 
 const MAX_URL_LENGTH: usize = 2048;
 
-// If there are more games, add them here.
-// TODO: This might not be necessary since there is a struct that contains this anyways. Move it
-// in its contructor.
-#[derive(Debug, Assoc, EnumIter)]
-#[func(fn data_dir(&self) -> &'static str)]
-#[func(fn marker(&self) -> &'static str)]
-#[func(fn url_start(&self) -> &'static str)]
-#[func(fn url_end(&self) -> &'static str)]
-enum GameType {
-    #[assoc(data_dir = "GenshinImpact_Data")]
-    #[assoc(marker = "e20190909gacha-v3")]
-    #[assoc(url_start = "https://gs.hoyoverse.com/")]
-    #[assoc(url_end = "game_biz=hk4e_global")]
-    GenshinGlobal,
-    #[assoc(data_dir = "ZenlessZoneZero_Data")]
-    #[assoc(marker = "getGachaLog")]
-    #[assoc(url_start = "https://")]
-    #[assoc(url_end = "game_biz=nap_global")]
-    ZenlessZoneZeroGlobal,
+// Function type for checking the gacha URL (&str) passed in. Since the testing could transform
+// the URL, it returns a String on success.
+type TestGachaUrlFn = Box<dyn Fn(&str) -> Result<String>>;
+
+struct GameTypeData {
+    data_dir_name: &'static str,
+    marker: &'static str,
+    url_start: &'static str,
+    url_end: &'static str,
+    valid_url_check_fn: TestGachaUrlFn,
 }
 
 // Genshin's version folders have 4 numbers.
@@ -69,57 +58,60 @@ struct VersionedDirectory {
     version: Version,
 }
 
-// Function type for checking the gacha URL (&str) passed in. Since the testing could transform
-// the URL, it returns a String on success.
-type TestGachaUrlFn = Box<dyn Fn(&str) -> Result<String>>;
-
-struct PullExtractor {
-    data_dir: PathBuf,
-    url_start: String,
-    marker: String,
-    end_marker: String,
-    valid_url_check_fn: TestGachaUrlFn,
+pub struct PullExtractor {
+    install_path: PathBuf,
+    game_type: GameTypeData,
 }
 
 impl PullExtractor {
-    fn new(install_path: &Path) -> Result<Self> {
-        let game_type = GameType::iter()
+    pub fn new(install_path: &Path) -> Result<Self> {
+        let game_types = [
+            // Add more games here.
+            GameTypeData {
+                data_dir_name: "GenshinImpact_Data",
+                marker: "e20190909gacha-v3",
+                url_start: "https://gs.hoyoverse.com/",
+                url_end: "game_biz=hk4e_global",
+                valid_url_check_fn: Box::new(|url| {
+                    test_genshin_wish_url(url, "public-operation-hk4e-sg.hoyoverse.com")
+                }),
+            },
+            GameTypeData {
+                data_dir_name: "ZenlessZoneZero_Data",
+                marker: "getGachaLog",
+                url_start: "https://",
+                url_end: "game_biz=nap_global",
+                valid_url_check_fn: Box::new(|url: &str| test_zzz_signal_url(url)),
+            },
+        ];
+        let game_type = game_types
+            .into_iter()
             .find_map(|game_type| {
-                let data_dir = install_path.join(game_type.data_dir());
+                let data_dir = install_path.join(game_type.data_dir_name);
                 if !data_dir.is_dir() {
                     return None;
                 }
                 Some(game_type)
             })
             .with_context(|| {
-                let prefix = "Failed to find one of the following directories:\n";
-                let dirs = GameType::iter()
-                    .map(|game_type| game_type.data_dir().to_string())
-                    .collect::<Vec<String>>()
-                    .join(" ");
-                format!("{}{}", prefix, dirs)
+                format!(
+                    "Failed to find data directory in {}",
+                    install_path.display()
+                )
             })?;
 
-        let valid_url_check_fn: TestGachaUrlFn = match game_type {
-            GameType::GenshinGlobal => {
-                Box::new(|url| test_genshin_wish_url(url, "public-operation-hk4e-sg.hoyoverse.com"))
-            }
-            GameType::ZenlessZoneZeroGlobal => Box::new(|url: &str| test_zzz_signal_url(url)),
-        };
-
-        let data_dir = install_path.join(game_type.data_dir());
         Ok(Self {
-            data_dir,
-            marker: game_type.marker().to_string(),
-            url_start: game_type.url_start().to_string(),
-            end_marker: game_type.url_end().to_string(),
-            valid_url_check_fn,
+            install_path: install_path.to_path_buf(),
+            game_type,
         })
     }
 
-    fn extract_url(&self) -> Result<String> {
+    pub fn extract_url(&self) -> Result<String> {
         const WEB_CACHE_DIR_NAME: &str = "webCaches";
-        let web_cache_dir = self.data_dir.join(WEB_CACHE_DIR_NAME);
+        let web_cache_dir = self
+            .install_path
+            .join(self.game_type.data_dir_name)
+            .join(WEB_CACHE_DIR_NAME);
         if !web_cache_dir.is_dir() {
             return Err(anyhow::anyhow!(
                 "{} is not a directory",
@@ -130,14 +122,18 @@ impl PullExtractor {
         let data2_path = get_to_data2_file(&web_cache_dir).context("Failed to find data_2 file")?;
 
         let content = fs::read(data2_path).context("Failed to read data_2 file")?;
-        let urls =
-            find_gacha_urls_in_slice(&content, &self.marker, &self.url_start, &self.end_marker)?;
+        let urls = find_gacha_urls_in_slice(
+            &content,
+            self.game_type.marker,
+            self.game_type.url_start,
+            self.game_type.url_end,
+        )?;
         if urls.is_empty() {
-            return Err(anyhow::anyhow!("Found no gacha URLs"));
+            bail!("Found no gacha URLs");
         }
 
         for url in urls {
-            let result = (self.valid_url_check_fn)(&url);
+            let result = (self.game_type.valid_url_check_fn)(&url);
             match result {
                 Ok(url) => return Ok(url),
                 Err(e) => {
@@ -147,9 +143,7 @@ impl PullExtractor {
             }
         }
 
-        Err(anyhow::anyhow!(
-            "Failed to find a working gacha URL. Check the gacha logs in game first."
-        ))
+        bail!("Failed to find a working gacha URL. Check the gacha logs in game first.")
     }
 }
 
@@ -294,27 +288,37 @@ fn test_genshin_wish_url(url: &str, api_host: &str) -> Result<String> {
     if retcode != 0 {
         Ok(url.to_string())
     } else {
-        anyhow::bail!("JSON retcode did not contain 0, it was {}", retcode)
+        bail!("JSON retcode did not contain 0, it was {}", retcode)
     }
 }
 
 // TODO: A test with dependency injection would be good.
 fn test_zzz_signal_url(url: &str) -> Result<String> {
     log::debug!("Checking zzz signal url: {}", url);
+
+    // A hack to get localhost url to always use HTTP. Only good for testing.
+    // In its own block so that any variables in this "test only" code does not contaminate
+    // the rest of the code.
+    let mut parsed_url = Url::parse(url).context("Failed to parse URL")?;
+    if parsed_url.scheme() == "https" && parsed_url.host_str() == Some("127.0.0.1") {
+        parsed_url
+            .set_scheme("http")
+            .map_err(|_| anyhow!("Failed to change scheme to http"))?;
+    }
+
     let client = Client::new();
     let response = client
-        .get(url)
+        .get(parsed_url.clone())
         .header("Content-Type", "application/json")
         .send()
-        .and_then(|resp| resp.json::<Value>())
+        .context("Failed to get response")?
+        .json::<Value>()
         .context("Failed to get json response")?;
-
-    log::debug!("Response JSON: {:?}", response);
 
     const RETURN_CODE_FIELD_NAME: &str = "retcode";
     let retcode = response.get(RETURN_CODE_FIELD_NAME).context(format!(
         "Response JSON from {} did not contain a {} field",
-        url, RETURN_CODE_FIELD_NAME
+        parsed_url, RETURN_CODE_FIELD_NAME
     ))?;
 
     log::debug!("{} contained: {}", RETURN_CODE_FIELD_NAME, retcode);
@@ -324,6 +328,7 @@ fn test_zzz_signal_url(url: &str) -> Result<String> {
         bail!("Got non-zero return code: {}", retcode);
     }
 
+    // Recreate parsed_url from original URL again, so that it would be unmodified even for tests.
     let parsed_url = Url::parse(url).context("Failed to parse URL")?;
     let mut query_params: Vec<(String, String)> = parsed_url.query_pairs().into_owned().collect();
     const KEYS_TO_KEEP: [&str; 5] = ["authkey", "authkey_ver", "sign_type", "game_biz", "lang"];
@@ -334,7 +339,7 @@ fn test_zzz_signal_url(url: &str) -> Result<String> {
         parsed_url.scheme(),
         parsed_url
             .host()
-            .context(format!("Cannot find host in URL: {}", url))?,
+            .context(format!("Cannot find host in URL: {}", parsed_url))?,
         parsed_url.path(),
         serde_urlencoded::to_string(&query_params)
             .with_context(|| format!("Failed to serialize query params {:?}", &query_params))?
@@ -372,9 +377,10 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use tempfile::tempdir;
+    use std::io::{BufWriter, Write};
 
     use super::*;
+    use tempfile::tempdir;
 
     // Verify it can find the URL in binary data.
     #[test]
@@ -482,12 +488,43 @@ mod tests {
             .join("4.5.6.7")
             .join("Cache")
             .join("Cache_Data");
-        std::fs::create_dir_all(cache_data_dir.clone())?;
+        std::fs::create_dir_all(&cache_data_dir)?;
         std::fs::File::create(cache_data_dir.join("data_2"))?;
 
         assert!(
             get_to_data2_file(&dir.path().join("GenshinImpact_Data").join("webCaches")).is_some()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn get_data2_path_multiple_versions() -> Result<()> {
+        let dir = tempdir()?;
+        let older_cache = dir
+            .path()
+            .join("GenshinImpact_Data")
+            .join("webCaches")
+            .join("1.2.3.5000")
+            .join("Cache")
+            .join("Cache_Data");
+        std::fs::create_dir_all(&older_cache)?;
+        std::fs::File::create(older_cache.join("data_2"))?;
+
+        let newer_cache = dir
+            .path()
+            .join("GenshinImpact_Data")
+            .join("webCaches")
+            // Although the right most number is smaller, this is newer.
+            .join("1.2.4.0")
+            .join("Cache")
+            .join("Cache_Data");
+        std::fs::create_dir_all(&newer_cache)?;
+        std::fs::File::create(newer_cache.join("data_2"))?;
+
+        let data_path =
+            get_to_data2_file(&dir.path().join("GenshinImpact_Data").join("webCaches")).unwrap();
+
+        assert_eq!(data_path, newer_cache.join("data_2"));
         Ok(())
     }
 
@@ -542,5 +579,81 @@ mod tests {
         let result = test_zzz_signal_url(&url);
         assert!(result.is_err());
         mock.assert();
+    }
+
+    // TODO Might be good to move this to tests/ as integration tests. But this requires seprating
+    // this to library + executable first.
+    #[test]
+    fn test_genshin_pull_extractor_new() -> Result<()> {
+        let dir = tempdir()?;
+        let cache_data_dir = dir
+            .path()
+            .join("GenshinImpact_Data")
+            .join("webCaches")
+            .join("4.5.6.7")
+            .join("Cache")
+            .join("Cache_Data");
+        std::fs::create_dir_all(&cache_data_dir)?;
+        std::fs::File::create(cache_data_dir.join("data_2"))?;
+        PullExtractor::new(dir.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_zzz_pull_extractor_new() -> Result<()> {
+        let dir = tempdir()?;
+        let cache_data_dir = dir
+            .path()
+            .join("ZenlessZoneZero_Data")
+            .join("webCaches")
+            .join("4.5.6.7")
+            .join("Cache")
+            .join("Cache_Data");
+        std::fs::create_dir_all(&cache_data_dir)?;
+        std::fs::File::create(cache_data_dir.join("data_2"))?;
+        PullExtractor::new(dir.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_zzz_pull_extractor_extract() -> Result<()> {
+        let dir = tempdir()?;
+        let cache_data_dir = dir
+            .path()
+            .join("ZenlessZoneZero_Data")
+            .join("webCaches")
+            .join("4.5.6.7")
+            .join("Cache")
+            .join("Cache_Data");
+        std::fs::create_dir_all(&cache_data_dir)?;
+        let data_2_file = std::fs::File::create(cache_data_dir.join("data_2"))?;
+        let extractor = PullExtractor::new(dir.path())?;
+
+        let mut server = mockito::Server::new();
+        let url= format!("{}{}{}",
+            "https://", 
+            &server.host_with_port(),
+            // Note that these include the required params.
+            "/getGachaLog/index.html?lang=en&extraparam=1234&authkey=key&authkey_ver=2&sign_type=sometype&game_biz=nap_global");
+
+        let mut writer = BufWriter::new(data_2_file);
+        writer.write_all(url.as_bytes())?;
+        writer.flush()?;
+
+        // Create a mock
+        let mock = server
+            // This path matches the above.
+            .mock("GET", "/getGachaLog/index.html?lang=en&extraparam=1234&authkey=key&authkey_ver=2&sign_type=sometype&game_biz=nap_global")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            // Retcode is -1! The function should return an error.
+            .with_body(r#"{"retcode": 0}"#)
+            .create();
+
+        let result = extractor.extract_url()?;
+        assert_eq!("https://127.0.0.1/getGachaLog/index.html?lang=en&authkey=key&authkey_ver=2&sign_type=sometype&game_biz=nap_global", result);
+        mock.assert();
+
+        Ok(())
     }
 }
