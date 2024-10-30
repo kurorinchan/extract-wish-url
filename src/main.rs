@@ -1,5 +1,5 @@
 use anyhow::bail;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use bstr::ByteSlice;
 use enum_assoc::Assoc;
 use reqwest::blocking::Client;
@@ -9,7 +9,6 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::env;
-use std::f32::consts::E;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
