@@ -2,6 +2,7 @@ use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::{Context, Result};
 use bstr::ByteSlice;
+use itertools::Itertools;
 use reqwest::blocking::Client;
 use reqwest::Url;
 use serde_json::Value;
@@ -69,8 +70,8 @@ impl PullExtractor {
             // Add more games here.
             GameTypeData {
                 data_dir_name: "GenshinImpact_Data",
-                marker: "e20190909gacha-v3",
-                url_start: "https://gs.hoyoverse.com/",
+                marker: "webview_gacha",
+                url_start: "https://",
                 url_end: "game_biz=hk4e_global",
                 valid_url_check_fn: Box::new(|url| {
                     test_genshin_wish_url(url, "public-operation-hk4e-sg.hoyoverse.com")
@@ -266,6 +267,13 @@ fn test_genshin_wish_url(url: &str, api_host: &str) -> Result<String> {
     query_params.insert("size".into(), "5".into());
     query_params.insert("lang".into(), "en-us".into());
 
+    // Sort the parameters, to make testing easier.
+    let query_params = query_params
+        .keys()
+        .sorted()
+        .map(|key| (key, query_params.get(key).unwrap()))
+        .collect_vec();
+
     uri.set_query(Some(
         &serde_urlencoded::to_string(&query_params).context("Failed to set query params")?,
     ));
@@ -285,7 +293,7 @@ fn test_genshin_wish_url(url: &str, api_host: &str) -> Result<String> {
     let retcode = retcode
         .as_i64()
         .context("Failed to convert retcode to i64")?;
-    if retcode != 0 {
+    if retcode == 0 {
         Ok(url.to_string())
     } else {
         bail!("JSON retcode did not contain 0, it was {}", retcode)
@@ -297,8 +305,6 @@ fn test_zzz_signal_url(url: &str) -> Result<String> {
     log::debug!("Checking zzz signal url: {}", url);
 
     // A hack to get localhost url to always use HTTP. Only good for testing.
-    // In its own block so that any variables in this "test only" code does not contaminate
-    // the rest of the code.
     let mut parsed_url = Url::parse(url).context("Failed to parse URL")?;
     if parsed_url.scheme() == "https" && parsed_url.host_str() == Some("127.0.0.1") {
         parsed_url
@@ -553,6 +559,34 @@ mod tests {
         // server.host_with_port() includes a port number.
         // Its ok to change the host here if the framework changes.
         assert_eq!("http://127.0.0.1/index.html?authkey=key&authkey_ver=2&sign_type=sometype&game_biz=nap_global&lang=en", result);
+        mock.assert();
+        Ok(())
+    }
+
+    #[test]
+    fn test_genshin_url() -> Result<()> {
+        let mut server = mockito::Server::new();
+        let url= format!("{}{}{}",
+            "http://", 
+            &server.host_with_port(),
+            "/index.html?extraparam=1234&authkey=key&authkey_ver=2&sign_type=sometype&game_biz=hk4e_global&lang=en&more=stuff&andsomemore=fluffs");
+
+        let mock = server
+            // Verify that the parameters are added.
+            .mock("GET", "/gacha_info/api/getGachaLog?andsomemore=fluffs&authkey=key&authkey_ver=2&extraparam=1234&gacha_type=301&game_biz=hk4e_global&lang=en-us&more=stuff&sign_type=sometype&size=5")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            // A minimal JSON to return retcode=0.
+            .with_body(r#"{"retcode": 0}"#)
+            .create();
+
+        let result = test_genshin_wish_url(&url, &server.host_with_port())?;
+
+        // Verify that the original URL is returned.
+        assert_eq!(
+            format!("http://{}/index.html?extraparam=1234&authkey=key&authkey_ver=2&sign_type=sometype&game_biz=hk4e_global&lang=en&more=stuff&andsomemore=fluffs",
+            &server.host_with_port()),
+            result);
         mock.assert();
         Ok(())
     }
